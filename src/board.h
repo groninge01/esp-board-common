@@ -160,11 +160,10 @@ void board_display_partition_blit(int32_t x_start, int32_t y_start,
 void board_display_enter_portrait_scan(void);
 void board_display_exit_portrait_scan(void);
 
-/* Single-writer panel blit for portrait scan mode: serializes the camera's
- * centered-square blit against LVGL's letterbox flush through the panel's one
- * DMA2D draw path (mutex + wait-own-completion) — both writers share the DPI
- * draw_sem, so a concurrent draw_bitmap trips ESP_ERR_INVALID_STATE. Ends
- * exclusive, like esp_lcd_panel_draw_bitmap. No-op stub on non-ST7701 boards. */
+/* Single-writer portrait-scan update: compose the camera square or LVGL's
+ * letterbox into an off-screen panel buffer, preserving other pixels, then
+ * present at a refresh boundary before reusing the retired buffer. Coordinates
+ * end exclusive, like esp_lcd_panel_draw_bitmap. No-op on non-ST7701 boards. */
 void board_display_portrait_scan_blit(int32_t x1, int32_t y1,
                                       int32_t x2, int32_t y2, const void *buf);
 

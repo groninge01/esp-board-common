@@ -16,6 +16,7 @@
 #include "freertos/semphr.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
+#include "esp_cache.h"
 #include "driver/gpio.h"
 
 #include "board.h"
@@ -724,36 +725,67 @@ static lv_display_t     *s_st7701_disp = NULL;
 static void             *s_st7701_draw_buf[2] = {NULL, NULL};
 static size_t            s_st7701_draw_buf_sz = 0;
 static bool              s_portrait_scan_active = false;
-/* Blit-completion signal for the portrait direct flush: use_dma2d=true makes DPI
- * draw_bitmap from an external (LVGL draw) buffer async, so the flush must wait
- * for the DMA2D copy before releasing the buffer back to LVGL. Given from the
- * panel's on_color_trans_done (registered alongside on_refresh_done in setup). */
+/* Completion signal shared by landscape DMA copies and portrait page flips.
+ * Given from on_color_trans_done (ISR for DMA, task context for page flips). */
 static SemaphoreHandle_t s_dsi_blit_done = NULL;
-/* Serializes the two portrait-scan writers (camera square + LVGL letterbox flush)
- * through the panel's one DMA2D draw path. */
+/* Serializes camera-square and LVGL-letterbox updates through presentation. */
 static SemaphoreHandle_t s_dsi_blit_mutex = NULL;
+/* Panel-owned buffers: preserve partial updates off-screen, then flip at refresh.
+ * Landscape DMA copies keep using the last selected buffer, so retain its index
+ * across scan sessions. The DPI driver initially scans buffer 0. */
+static uint16_t *s_dsi_panel_fb[2] = {NULL, NULL};
+static unsigned s_dsi_front_idx = 0;
 
 static bool dpi_color_trans_done_cb(esp_lcd_panel_handle_t panel,
                                     esp_lcd_dpi_panel_event_data_t *edata,
                                     void *user_ctx)
 {
     (void)panel; (void)edata; (void)user_ctx;
+    if (!s_dsi_blit_done) return false;
+    /* Panel-owned page flips complete synchronously in the calling task;
+     * landscape DMA copies still complete from an ISR. */
+    if (!xPortInIsrContext()) {
+        xSemaphoreGive(s_dsi_blit_done);
+        return false;
+    }
     BaseType_t woken = pdFALSE;
-    if (s_dsi_blit_done) xSemaphoreGiveFromISR(s_dsi_blit_done, &woken);
+    xSemaphoreGiveFromISR(s_dsi_blit_done, &woken);
     return (woken == pdTRUE);
 }
 
-/* Single-writer gate: draw_bitmap + wait for the (async, use_dma2d) copy, under a
- * mutex so the camera square and the LVGL letterbox flush never issue overlapping
- * draw_bitmaps (which would trip the DPI driver's draw_sem). */
+/* Compose each partial update into an off-screen panel buffer, preserving the
+ * other writer's pixels. Keep the gate until the previous scanout has retired. */
 void board_display_portrait_scan_blit(int32_t x1, int32_t y1,
                                       int32_t x2, int32_t y2, const void *buf)
 {
     if (!s_dsi_blit_mutex) return;
     xSemaphoreTake(s_dsi_blit_mutex, portMAX_DELAY);
-    if (s_dsi_blit_done) xSemaphoreTake(s_dsi_blit_done, 0);            /* drain stale */
-    esp_lcd_panel_draw_bitmap(panel_handle, x1, y1, x2, y2, buf);
-    if (s_dsi_blit_done) xSemaphoreTake(s_dsi_blit_done, pdMS_TO_TICKS(100));
+
+    const size_t frame_bytes = BOARD_LCD_H_RES * BOARD_LCD_V_RES * sizeof(uint16_t);
+    uint16_t *front = s_dsi_panel_fb[s_dsi_front_idx];
+    uint16_t *back = s_dsi_panel_fb[s_dsi_front_idx ^ 1];
+    /* Landscape DMA may have changed the front buffer since the last scan. */
+    ESP_ERROR_CHECK(esp_cache_msync(front, frame_bytes, ESP_CACHE_MSYNC_FLAG_DIR_M2C));
+    memcpy(back, front, frame_bytes);
+    const uint16_t *src = buf;
+    const size_t width = x2 - x1;
+    for (int32_t y = y1; y < y2; y++) {
+        memcpy(back + y * BOARD_LCD_H_RES + x1, src, width * sizeof(uint16_t));
+        src += width;
+    }
+
+    if (s_dsi_blit_done) xSemaphoreTake(s_dsi_blit_done, 0);
+    /* A panel-owned buffer selects the next refresh instead of DMA-copying
+     * into the currently scanned frame. IDF also writes back its cache. */
+    ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel_handle, 0, 0,
+                    BOARD_LCD_H_RES, BOARD_LCD_V_RES, back));
+    if (s_dsi_blit_done) xSemaphoreTake(s_dsi_blit_done, portMAX_DELAY);
+    xSemaphoreTake(dpi_flush_sem, 0);
+    /* The first event may finish a refresh already in flight at submission.
+     * Wait through the following refresh too before reusing the retired buffer. */
+    xSemaphoreTake(dpi_flush_sem, portMAX_DELAY);
+    xSemaphoreTake(dpi_flush_sem, portMAX_DELAY);
+    s_dsi_front_idx ^= 1;
     xSemaphoreGive(s_dsi_blit_mutex);
 }
 
@@ -918,13 +950,9 @@ static void st7701_flush_wait_cb(lv_display_t *disp)
 
 /* ── Portrait scan flush ──
  * Native-portrait, NO rotation: LVGL renders (PARTIAL) directly in panel
- * coordinates, so each dirty area blits straight to the panel. draw_bitmap from
- * an external buffer is async (DMA2D), so wait for the copy (drain-before,
- * wait-after on s_dsi_blit_done) before flush_ready, or LVGL reuses px_map
- * mid-copy and the next draw_bitmap trips the driver's draw_sem (INVALID_STATE).
- * Runs under the LVGL lock (esp_lvgl_port wraps lv_timer_handler); the ~2-4 ms
- * DMA2D copy of a letterbox strip is short enough not to starve the camera's
- * try-lock push. */
+ * coordinates. Compose each dirty area into the off-screen panel buffer, then
+ * wait for presentation before releasing px_map back to LVGL. Camera-square
+ * updates use the same gate so letterbox updates preserve the live preview. */
 static void st7701_portrait_flush_cb(lv_display_t *disp,
                                      const lv_area_t *area, uint8_t *px_map)
 {
@@ -1116,6 +1144,9 @@ static void lvgl_port_setup(const board_app_config_t *app_cfg,
         dpi_flush_sem = xSemaphoreCreateBinary();
         s_dsi_blit_done = xSemaphoreCreateBinary();
         s_dsi_blit_mutex = xSemaphoreCreateMutex();
+        assert(dpi_flush_sem && s_dsi_blit_done && s_dsi_blit_mutex);
+        ESP_ERROR_CHECK(esp_lcd_dpi_panel_get_frame_buffer(panel_handle, 2,
+                        (void **)&s_dsi_panel_fb[0], (void **)&s_dsi_panel_fb[1]));
 
         /* Deferred-flush plumbing — created BEFORE the display so the flush task
          * is ready before esp_lvgl_port can call the flush_cb. */
