@@ -114,7 +114,11 @@ void board_display_st7701_init(esp_lcd_panel_io_handle_t *io_handle,
     esp_lcd_dsi_bus_config_t bus_config = {
         .bus_id = 0,
         .num_data_lanes = BOARD_MIPI_DSI_LANE_NUM,
-        .phy_clk_src = 0, // Let ESP-IDF choose the clock for this chip revision.
+        /* .phy_clk_src is left unset on purpose. ESP-IDF then picks the PHY PLL
+         * reference that exists on the chip revision being built for: PLL_F20M
+         * before v3, XTAL on v3. MIPI_DSI_PHY_CLK_SRC_DEFAULT is a back-compat alias
+         * for PLL_F20M, which v3 silicon lacks, so naming it aborts
+         * esp_lcd_new_dsi_bus() on a v3 chip. */
         .lane_bit_rate_mbps = BOARD_MIPI_DSI_LANE_BITRATE_MBPS,
     };
     ESP_ERROR_CHECK(esp_lcd_new_dsi_bus(&bus_config, &mipi_dsi_bus));
